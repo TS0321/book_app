@@ -1,0 +1,18 @@
+<!doctype html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>新規予約</title>
+<link rel="stylesheet" href="/static/style.css">
+</head><body>
+<header><h1>新規予約</h1><nav><a href="/">← 戻る</a></nav></header>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<form method="post" action="/new" class="form">
+  <label>名前<input name="name" required value="{{ prefill.name if prefill else '' }}"></label>
+  <label>日付<input type="date" name="date_str" required value="{{ prefill.date_str if prefill else '' }}"></label>
+  <label>開始時刻<input type="time" name="start_time" required value="{{ prefill.start_time if prefill else '' }}"></label>
+  <label>所要時間(分)<input type="number" name="minutes" min="10" step="5" value="{{ prefill.minutes if prefill else 30 }}"></label>
+  <label>メモ<textarea name="memo">{{ prefill.memo if prefill else '' }}</textarea></label>
+  <button>予約を作成</button>
+</form>
+</body></html>
