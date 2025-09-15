@@ -3,14 +3,14 @@ import os, csv, io
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import FastAPI, Request, Form, status
+from fastapi import FastAPI, Request, Form, status, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
 
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, func
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, func, text
 from sqlalchemy.orm import sessionmaker, declarative_base
 from dotenv import load_dotenv
 import asyncio
@@ -34,15 +34,20 @@ class Booking(Base):
     end_at   = Column(DateTime(timezone=True), nullable=False)
     minutes  = Column(Integer, nullable=False, default=30)
     status   = Column(String(20), nullable=False, default="Booked")  # Booked/Done/Cancel
-    fee_jpy  = Column(Integer, nullable=True)  # Done時に1000
+    fee_jpy  = Column(Integer, nullable=True)  # Done 時に 1000
     memo     = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(JST))
 
 Base.metadata.create_all(engine)
 
+# 索引（初回だけ作成される）
+with engine.begin() as conn:
+    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_bookings_start_at ON bookings(start_at)"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_bookings_status_start ON bookings(status, start_at)"))
+
 app = FastAPI(title="Home Pilates Booking")
 
-# CORS（LAN内のStreamlitから呼べるように緩めに）
+# CORS（LAN の Streamlit から呼べるよう緩め）
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -98,10 +103,13 @@ async def notify(subject: str, message: str):
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request, days: int = 7):
     db = SessionLocal()
-    now = datetime.now(JST); until = now + timedelta(days=days)
+    now = datetime.now(JST)
+    # 今日 0:00 から表示（同日の過去も見えるように）
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    until = start + timedelta(days=days)
     items = (db.query(Booking)
-               .filter(Booking.start_at >= now - timedelta(hours=12))
-               .filter(Booking.start_at <= until)
+               .filter(Booking.start_at >= start)
+               .filter(Booking.start_at <  until)
                .order_by(Booking.start_at.asc())
                .all())
     db.close()
@@ -130,14 +138,14 @@ async def create_booking(
     d = datetime.strptime(date_str, "%Y-%m-%d").date()
     parts = start_time.split(":"); h = int(parts[0]); m = int(parts[1]) if len(parts) > 1 else 0
     s = dt_merge(d, time(h, m)); e = s + timedelta(minutes=minutes)
-    now = datetime.now(JST)
-    if s < now:
+
+    # 過去禁止
+    if s < datetime.now(JST):
         return templates.TemplateResponse("new.html", {
             "request": request,
             "error": "過去の時刻には予約できません（現在以降を選んでください）。",
             "prefill": {"name": name, "date_str": date_str, "start_time": start_time, "minutes": minutes, "memo": memo}
         }, status_code=status.HTTP_400_BAD_REQUEST)
-
 
     db = SessionLocal()
     exists = db.query(Booking).filter(Booking.status != "Cancel").all()
@@ -193,8 +201,7 @@ def export_csv():
     return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=bookings.csv"})
 
-# ---------------- API（新規） ----------------
-# Pydanticモデル
+# ---------------- API ----------------
 class BookingIn(BaseModel):
     name: str = Field(..., max_length=100)
     start_date: date
@@ -216,13 +223,19 @@ class StatusIn(BaseModel):
     action: str  # "book" | "done" | "cancel"
 
 @app.get("/api/bookings", response_model=List[BookingOut])
-def api_list_bookings(fr: Optional[datetime] = None, to: Optional[datetime] = None, status_eq: Optional[str] = None):
+def api_list_bookings(
+    fr: Optional[datetime] = None,
+    to: Optional[datetime] = None,
+    status_eq: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+):
     db = SessionLocal()
     q = db.query(Booking)
     if fr: q = q.filter(Booking.start_at >= fr)
     if to: q = q.filter(Booking.start_at <= to)
     if status_eq: q = q.filter(Booking.status == status_eq)
-    rows = q.order_by(Booking.start_at.asc()).all()
+    rows = q.order_by(Booking.start_at.asc()).limit(limit).offset(offset).all()
     db.close()
     return [
         BookingOut(
@@ -234,23 +247,23 @@ def api_list_bookings(fr: Optional[datetime] = None, to: Optional[datetime] = No
 
 @app.post("/api/bookings", response_model=BookingOut, status_code=201)
 def api_create_booking(payload: BookingIn):
-    # parse time
     parts = payload.start_time.split(":")
     h = int(parts[0]); m = int(parts[1]) if len(parts) > 1 else 0
     s = dt_merge(payload.start_date, time(h, m)); e = s + timedelta(minutes=payload.minutes)
+
+    # 過去禁止（API でも明示）
+    if s < datetime.now(JST):
+        raise HTTPException(status_code=400, detail="Cannot create booking in the past.")
 
     db = SessionLocal()
     exists = db.query(Booking).filter(Booking.status != "Cancel").all()
     for b in exists:
         if overlaps(b.start_at, b.end_at, s, e):
             db.close()
-            # 409: 重複
-            from fastapi import HTTPException
-            raise HTTPException(409, "Time slot overlaps an existing booking.")
+            raise HTTPException(status_code=409, detail="Time slot overlaps an existing booking.")
     bk = Booking(name=payload.name, start_at=s, end_at=e, minutes=payload.minutes, memo=payload.memo or "")
     db.add(bk); db.commit(); db.refresh(bk); db.close()
 
-    # 通知はUI経由でもAPI経由でも同様に送る
     subj = f"【予約】{bk.start_at.strftime('%Y/%m/%d %H:%M')} {bk.name}"
     body = f"{bk.name}\n{bk.start_at.strftime('%Y/%m/%d %H:%M')} - {bk.end_at.strftime('%H:%M')}（{payload.minutes}分）\n{payload.memo or ''}"
     try:
@@ -267,7 +280,6 @@ def api_create_booking(payload: BookingIn):
 def api_update_status(bid: int, payload: StatusIn):
     db = SessionLocal(); b = db.query(Booking).get(bid)
     if not b:
-        from fastapi import HTTPException
         db.close(); raise HTTPException(404, "Booking not found")
     if payload.action == "done":
         b.status = "Done"; b.fee_jpy = b.fee_jpy or 1000
@@ -276,7 +288,6 @@ def api_update_status(bid: int, payload: StatusIn):
     elif payload.action == "book":
         b.status = "Booked"; b.fee_jpy = None
     else:
-        from fastapi import HTTPException
         db.close(); raise HTTPException(400, "Invalid action")
     db.commit(); db.refresh(b); db.close()
     return BookingOut(
@@ -305,3 +316,16 @@ def api_stats_monthly(year: int, month: int):
             .one())
     db.close()
     return {"year": year, "month": month, "done_count": rows.done_count, "total_fee": rows.total_fee}
+
+@app.delete("/api/bookings/{bid}", status_code=204)
+def api_delete_booking(bid: int):
+    """予約を完全削除する"""
+    db = SessionLocal()
+    b = db.query(Booking).get(bid)
+    if not b:
+        db.close()
+        raise HTTPException(status_code=404, detail="Booking not found")
+    db.delete(b)
+    db.commit()
+    db.close()
+    return  # 204 No Content
