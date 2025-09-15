@@ -1,12 +1,16 @@
 from datetime import datetime, date, time, timedelta, timezone
 import os, csv, io
 from pathlib import Path
+from typing import List, Optional
 
-from fastapi import FastAPI, Request, Form, status, Depends, HTTPException
+from fastapi import FastAPI, Request, Form, status
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
+from fastapi.middleware.cors import CORSMiddleware
+
+from pydantic import BaseModel, Field
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, func
 from sqlalchemy.orm import sessionmaker, declarative_base
 from dotenv import load_dotenv
 import asyncio
@@ -38,6 +42,13 @@ Base.metadata.create_all(engine)
 
 app = FastAPI(title="Home Pilates Booking")
 
+# CORS（LAN内のStreamlitから呼べるように緩めに）
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
+
 # --- TEMPLATES & STATIC ---
 BASE_DIR = Path(__file__).parent
 (static := BASE_DIR / "static").mkdir(exist_ok=True)
@@ -50,11 +61,9 @@ def dt_merge(d: date, t: time) -> datetime:
     return datetime(d.year, d.month, d.day, t.hour, t.minute, tzinfo=JST)
 
 def _to_aware_jst(dt: datetime) -> datetime:
-    # tzinfo が無ければ JST として扱う
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=JST)
 
 def overlaps(s1: datetime, e1: datetime, s2: datetime, e2: datetime) -> bool:
-    # naive/aware 混在でも安全に比較できるよう正規化
     s1 = _to_aware_jst(s1); e1 = _to_aware_jst(e1)
     s2 = _to_aware_jst(s2); e2 = _to_aware_jst(e2)
     return not (e1 <= s2 or e2 <= s1)
@@ -70,7 +79,6 @@ async def notify(subject: str, message: str):
                     data={"message": f"{subject}\n{message}"}
                 )
         except Exception:
-            # 通知失敗はアプリを落とさない
             pass
     # Email
     if os.getenv("SMTP_HOST") and os.getenv("NOTIFY_TO"):
@@ -86,24 +94,20 @@ async def notify(subject: str, message: str):
         except Exception:
             pass
 
-# --- ROUTES ---
+# ---------------- Web画面（既存） ----------------
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request, days: int = 7):
     db = SessionLocal()
-    now = datetime.now(JST)
-    until = now + timedelta(days=days)
+    now = datetime.now(JST); until = now + timedelta(days=days)
     items = (db.query(Booking)
                .filter(Booking.start_at >= now - timedelta(hours=12))
                .filter(Booking.start_at <= until)
                .order_by(Booking.start_at.asc())
                .all())
     db.close()
-    # 取り出し直後に tz を正規化しておくとテンプレ側でも安全
     for b in items:
         b.start_at = _to_aware_jst(b.start_at)
         b.end_at   = _to_aware_jst(b.end_at)
-
-    # 日付ごとにグループ化
     grouped = {}
     for b in items:
         key = b.start_at.astimezone(JST).date()
@@ -119,20 +123,23 @@ async def create_booking(
     request: Request,
     name: str = Form(...),
     date_str: str = Form(...),          # yyyy-mm-dd
-    start_time: str = Form(...),        # "HH:MM" or "HH:MM:SS" にも対応
+    start_time: str = Form(...),        # HH:MM or HH:MM:SS
     minutes: int = Form(30),
     memo: str = Form(""),
 ):
-    # 日付
     d = datetime.strptime(date_str, "%Y-%m-%d").date()
-    # 時刻（秒付きにも対応）
-    parts = start_time.split(":")
-    h = int(parts[0]); m = int(parts[1]) if len(parts) > 1 else 0
-    s = dt_merge(d, time(h, m))
-    e = s + timedelta(minutes=minutes)
+    parts = start_time.split(":"); h = int(parts[0]); m = int(parts[1]) if len(parts) > 1 else 0
+    s = dt_merge(d, time(h, m)); e = s + timedelta(minutes=minutes)
+    now = datetime.now(JST)
+    if s < now:
+        return templates.TemplateResponse("new.html", {
+            "request": request,
+            "error": "過去の時刻には予約できません（現在以降を選んでください）。",
+            "prefill": {"name": name, "date_str": date_str, "start_time": start_time, "minutes": minutes, "memo": memo}
+        }, status_code=status.HTTP_400_BAD_REQUEST)
+
 
     db = SessionLocal()
-    # 重複チェック（Cancel以外）
     exists = db.query(Booking).filter(Booking.status != "Cancel").all()
     for b in exists:
         if overlaps(b.start_at, b.end_at, s, e):
@@ -142,12 +149,9 @@ async def create_booking(
                 "error": "同時間帯に既存の予約があるため作成できません。",
                 "prefill": {"name": name, "date_str": date_str, "start_time": start_time, "minutes": minutes, "memo": memo}
             })
-
-    # 作成
     bk = Booking(name=name, start_at=s, end_at=e, minutes=minutes, memo=memo)
     db.add(bk); db.commit(); db.refresh(bk); db.close()
 
-    # 通知（安全に fire-and-forget）
     subj = f"【予約】{bk.start_at.strftime('%Y/%m/%d %H:%M')} {name}"
     body = f"{name}\n{bk.start_at.strftime('%Y/%m/%d %H:%M')} - {bk.end_at.strftime('%H:%M')}（{minutes}分）\n{memo or ''}"
     try:
@@ -162,27 +166,20 @@ def update_status(bid: int, action: str = Form(...)):
     db = SessionLocal()
     b = db.query(Booking).get(bid)
     if not b:
-        db.close()
-        return RedirectResponse("/", status_code=303)
+        db.close(); return RedirectResponse("/", status_code=303)
     if action == "done":
-        b.status = "Done"
-        if b.fee_jpy is None:
-            b.fee_jpy = 1000
+        b.status = "Done"; b.fee_jpy = b.fee_jpy or 1000
     elif action == "cancel":
         b.status = "Cancel"
     elif action == "book":
-        b.status = "Booked"
-        b.fee_jpy = None
+        b.status = "Booked"; b.fee_jpy = None
     db.commit(); db.close()
     return RedirectResponse("/", status_code=303)
 
 @app.get("/export.csv")
 def export_csv():
-    db = SessionLocal()
-    rows = db.query(Booking).order_by(Booking.start_at.desc()).all()
-    db.close()
-    buf = io.StringIO()
-    w = csv.writer(buf)
+    db = SessionLocal(); rows = db.query(Booking).order_by(Booking.start_at.desc()).all(); db.close()
+    buf = io.StringIO(); w = csv.writer(buf)
     w.writerow(["id","name","start_at","end_at","minutes","status","fee_jpy","memo","created_at"])
     for r in rows:
         w.writerow([
@@ -193,6 +190,118 @@ def export_csv():
             _to_aware_jst(r.created_at).isoformat() if r.created_at else ""
         ])
     buf.seek(0)
-    return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv", headers={
-        "Content-Disposition": "attachment; filename=bookings.csv"
-    })
+    return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=bookings.csv"})
+
+# ---------------- API（新規） ----------------
+# Pydanticモデル
+class BookingIn(BaseModel):
+    name: str = Field(..., max_length=100)
+    start_date: date
+    start_time: str  # "HH:MM" or "HH:MM:SS"
+    minutes: int = 30
+    memo: Optional[str] = ""
+
+class BookingOut(BaseModel):
+    id: int
+    name: str
+    start_at: datetime
+    end_at: datetime
+    minutes: int
+    status: str
+    fee_jpy: Optional[int]
+    memo: Optional[str]
+
+class StatusIn(BaseModel):
+    action: str  # "book" | "done" | "cancel"
+
+@app.get("/api/bookings", response_model=List[BookingOut])
+def api_list_bookings(fr: Optional[datetime] = None, to: Optional[datetime] = None, status_eq: Optional[str] = None):
+    db = SessionLocal()
+    q = db.query(Booking)
+    if fr: q = q.filter(Booking.start_at >= fr)
+    if to: q = q.filter(Booking.start_at <= to)
+    if status_eq: q = q.filter(Booking.status == status_eq)
+    rows = q.order_by(Booking.start_at.asc()).all()
+    db.close()
+    return [
+        BookingOut(
+            id=r.id, name=r.name,
+            start_at=_to_aware_jst(r.start_at), end_at=_to_aware_jst(r.end_at),
+            minutes=r.minutes, status=r.status, fee_jpy=r.fee_jpy, memo=r.memo
+        ) for r in rows
+    ]
+
+@app.post("/api/bookings", response_model=BookingOut, status_code=201)
+def api_create_booking(payload: BookingIn):
+    # parse time
+    parts = payload.start_time.split(":")
+    h = int(parts[0]); m = int(parts[1]) if len(parts) > 1 else 0
+    s = dt_merge(payload.start_date, time(h, m)); e = s + timedelta(minutes=payload.minutes)
+
+    db = SessionLocal()
+    exists = db.query(Booking).filter(Booking.status != "Cancel").all()
+    for b in exists:
+        if overlaps(b.start_at, b.end_at, s, e):
+            db.close()
+            # 409: 重複
+            from fastapi import HTTPException
+            raise HTTPException(409, "Time slot overlaps an existing booking.")
+    bk = Booking(name=payload.name, start_at=s, end_at=e, minutes=payload.minutes, memo=payload.memo or "")
+    db.add(bk); db.commit(); db.refresh(bk); db.close()
+
+    # 通知はUI経由でもAPI経由でも同様に送る
+    subj = f"【予約】{bk.start_at.strftime('%Y/%m/%d %H:%M')} {bk.name}"
+    body = f"{bk.name}\n{bk.start_at.strftime('%Y/%m/%d %H:%M')} - {bk.end_at.strftime('%H:%M')}（{payload.minutes}分）\n{payload.memo or ''}"
+    try:
+        asyncio.get_running_loop().create_task(notify(subj, body))
+    except RuntimeError:
+        asyncio.run(notify(subj, body))
+
+    return BookingOut(
+        id=bk.id, name=bk.name, start_at=bk.start_at, end_at=bk.end_at,
+        minutes=bk.minutes, status=bk.status, fee_jpy=bk.fee_jpy, memo=bk.memo
+    )
+
+@app.post("/api/bookings/{bid}/status", response_model=BookingOut)
+def api_update_status(bid: int, payload: StatusIn):
+    db = SessionLocal(); b = db.query(Booking).get(bid)
+    if not b:
+        from fastapi import HTTPException
+        db.close(); raise HTTPException(404, "Booking not found")
+    if payload.action == "done":
+        b.status = "Done"; b.fee_jpy = b.fee_jpy or 1000
+    elif payload.action == "cancel":
+        b.status = "Cancel"
+    elif payload.action == "book":
+        b.status = "Booked"; b.fee_jpy = None
+    else:
+        from fastapi import HTTPException
+        db.close(); raise HTTPException(400, "Invalid action")
+    db.commit(); db.refresh(b); db.close()
+    return BookingOut(
+        id=b.id, name=b.name,
+        start_at=_to_aware_jst(b.start_at), end_at=_to_aware_jst(b.end_at),
+        minutes=b.minutes, status=b.status, fee_jpy=b.fee_jpy, memo=b.memo
+    )
+
+@app.get("/api/stats/monthly")
+def api_stats_monthly(year: int, month: int):
+    # 月初〜月末（JST）
+    start = datetime(year, month, 1, 0, 0, tzinfo=JST)
+    if month == 12:
+        end = datetime(year+1, 1, 1, 0, 0, tzinfo=JST) - timedelta(seconds=1)
+    else:
+        end = datetime(year, month+1, 1, 0, 0, tzinfo=JST) - timedelta(seconds=1)
+
+    db = SessionLocal()
+    rows = (db.query(
+                func.count(Booking.id).label("done_count"),
+                func.coalesce(func.sum(Booking.fee_jpy), 0).label("total_fee")
+            )
+            .filter(Booking.status == "Done")
+            .filter(Booking.start_at >= start)
+            .filter(Booking.start_at <= end)
+            .one())
+    db.close()
+    return {"year": year, "month": month, "done_count": rows.done_count, "total_fee": rows.total_fee}
