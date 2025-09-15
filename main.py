@@ -329,3 +329,42 @@ def api_delete_booking(bid: int):
     db.commit()
     db.close()
     return  # 204 No Content
+
+# --- DBモデル ---
+class Feedback(Base):
+    __tablename__ = "feedbacks"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    text = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(JST))
+
+Base.metadata.create_all(engine)
+
+# --- API ---
+from pydantic import BaseModel
+class FeedbackIn(BaseModel):
+    text: str
+
+class FeedbackOut(BaseModel):
+    id: int
+    text: str
+    created_at: datetime
+
+@app.post("/api/feedback", response_model=FeedbackOut, status_code=201)
+def api_create_feedback(payload: FeedbackIn):
+    db = SessionLocal()
+    fb = Feedback(text=payload.text)
+    db.add(fb)
+    db.commit()
+    db.refresh(fb)
+    db.close()
+    return FeedbackOut(id=fb.id, text=fb.text, created_at=_to_aware_jst(fb.created_at))
+
+@app.get("/api/feedback", response_model=List[FeedbackOut])
+def api_list_feedback():
+    db = SessionLocal()
+    rows = db.query(Feedback).order_by(Feedback.created_at.desc()).all()
+    db.close()
+    return [
+        FeedbackOut(id=r.id, text=r.text, created_at=_to_aware_jst(r.created_at))
+        for r in rows
+    ]

@@ -159,7 +159,8 @@ def next_quarter(dt_now: dt.datetime) -> dt.datetime:
         return dt_now.replace(minute=0, second=0, microsecond=0) + dt.timedelta(hours=1)
     return dt_now.replace(minute=m, second=0, microsecond=0)
 
-tab_new, tab_list, tab_stats = st.tabs(["新規予約", "一覧操作", "月次集計"])
+tab_new, tab_list, tab_stats, tab_feedback = st.tabs(["新規予約", "一覧操作", "月次集計", "要望リスト"])
+
 
 # ---------- 新規予約 ----------
 with tab_new:
@@ -272,3 +273,40 @@ with tab_stats:
         st.subheader(f"{year}年{month}月")
         render_done_calendar(int(year), int(month), rows)
 
+# ---------- 要望リスト ----------
+with tab_feedback:
+    st.subheader("アプリへの要望を書いてください")
+
+    with st.form("feedback_form"):
+        fb_text = st.text_area("要望内容", height=120, placeholder="例: カレンダーに色分け機能を追加してほしい")
+        submitted = st.form_submit_button("送信")
+    if submitted:
+        if not fb_text.strip():
+            st.warning("内容を入力してください")
+        else:
+            try:
+                r = _session.post(f"{BACKEND}/api/feedback", json={"text": fb_text.strip()}, timeout=10)
+                if r.status_code == 201:
+                    st.success("要望を送信しました。ありがとうございます！")
+                    st.cache_data.clear()
+                else:
+                    st.error(f"送信失敗: {r.status_code} {r.text}")
+            except Exception as e:
+                st.error(f"通信エラー: {e}")
+
+    st.divider()
+    st.subheader("これまでの要望")
+    try:
+        r = _session.get(f"{BACKEND}/api/feedback", timeout=10)
+        if r.ok:
+            fb_list = r.json()
+            if not fb_list:
+                st.info("まだ要望はありません。")
+            else:
+                for fb in fb_list:
+                    t = pd.to_datetime(fb["created_at"]).strftime("%Y/%m/%d %H:%M")
+                    st.markdown(f"**{t}**  \n{fb['text']}")
+        else:
+            st.error(f"取得失敗: {r.status_code}")
+    except Exception as e:
+        st.error(f"通信エラー: {e}")
