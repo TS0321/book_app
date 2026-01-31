@@ -1,5 +1,5 @@
 from datetime import datetime, date, time, timedelta, timezone
-import os, csv, io
+import os, csv, io, json
 from pathlib import Path
 from typing import List, Optional
 
@@ -37,6 +37,14 @@ class Booking(Base):
     fee_jpy  = Column(Integer, nullable=True)  # Done 時に 1000
     memo     = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(JST))
+
+
+class RegisteredName(Base):
+    __tablename__ = "registered_names"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(100), nullable=False, unique=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(JST))
+
 
 Base.metadata.create_all(engine)
 
@@ -99,6 +107,18 @@ async def notify(subject: str, message: str):
         except Exception:
             pass
 
+
+def ensure_name_registered(db, name: str) -> None:
+    """名前が登録されていなければ登録する"""
+    if not name or not name.strip():
+        return
+    name = name.strip()
+    if db.query(RegisteredName).filter(RegisteredName.name == name).first():
+        return
+    db.add(RegisteredName(name=name))
+    db.commit()
+
+
 # ---------------- Web画面（既存） ----------------
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request, days: int = 7, booking_created: Optional[str] = None):
@@ -127,7 +147,15 @@ def index(request: Request, days: int = 7, booking_created: Optional[str] = None
 
 @app.get("/new", response_class=HTMLResponse)
 def new_form(request: Request):
-    return templates.TemplateResponse("new.html", {"request": request})
+    db = SessionLocal()
+    names = [r.name for r in db.query(RegisteredName).order_by(RegisteredName.name).all()]
+    db.close()
+    return templates.TemplateResponse("new.html", {
+        "request": request,
+        "registered_names": names,
+        "registered_names_json": json.dumps(names),
+        "prefill_name_json": json.dumps(""),
+    })
 
 @app.post("/new")
 async def create_booking(
@@ -144,24 +172,38 @@ async def create_booking(
 
     # 過去禁止
     if s < datetime.now(JST):
+        db = SessionLocal()
+        names = [r.name for r in db.query(RegisteredName).order_by(RegisteredName.name).all()]
+        db.close()
         return templates.TemplateResponse("new.html", {
             "request": request,
             "error": "過去の時刻には予約できません（現在以降を選んでください）。",
-            "prefill": {"name": name, "date_str": date_str, "start_time": start_time, "minutes": minutes, "memo": memo}
+            "prefill": {"name": name, "date_str": date_str, "start_time": start_time, "minutes": minutes, "memo": memo},
+            "registered_names": names,
+            "registered_names_json": json.dumps(names),
+            "prefill_name_json": json.dumps(name),
         }, status_code=status.HTTP_400_BAD_REQUEST)
 
     db = SessionLocal()
     exists = db.query(Booking).filter(Booking.status != "Cancel").all()
     for b in exists:
         if overlaps(b.start_at, b.end_at, s, e):
+            names = [r.name for r in db.query(RegisteredName).order_by(RegisteredName.name).all()]
             db.close()
             return templates.TemplateResponse("new.html", {
                 "request": request,
                 "error": "同時間帯に既存の予約があるため作成できません。",
-                "prefill": {"name": name, "date_str": date_str, "start_time": start_time, "minutes": minutes, "memo": memo}
+                "prefill": {"name": name, "date_str": date_str, "start_time": start_time, "minutes": minutes, "memo": memo},
+                "registered_names": names,
+                "registered_names_json": json.dumps(names),
+                "prefill_name_json": json.dumps(name),
             })
-    bk = Booking(name=name, start_at=s, end_at=e, minutes=minutes, memo=memo)
-    db.add(bk); db.commit(); db.refresh(bk); db.close()
+    bk = Booking(name=name.strip(), start_at=s, end_at=e, minutes=minutes, memo=memo)
+    db.add(bk)
+    db.commit()
+    db.refresh(bk)
+    ensure_name_registered(db, name)
+    db.close()
 
     subj = f"【予約】{bk.start_at.strftime('%Y/%m/%d %H:%M')} {name}"
     body = f"{name}\n{bk.start_at.strftime('%Y/%m/%d %H:%M')} - {bk.end_at.strftime('%H:%M')}（{minutes}分）\n{memo or ''}"
@@ -203,6 +245,36 @@ def export_csv():
     buf.seek(0)
     return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=bookings.csv"})
+
+
+# ---------------- 登録名 API ----------------
+@app.get("/api/names", response_model=List[str])
+def api_list_names():
+    db = SessionLocal()
+    names = [r.name for r in db.query(RegisteredName).order_by(RegisteredName.name).all()]
+    db.close()
+    return names
+
+
+class NameIn(BaseModel):
+    name: str = Field(..., max_length=100)
+
+
+@app.post("/api/names", status_code=201)
+def api_register_name(payload: NameIn):
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name is required.")
+    db = SessionLocal()
+    if db.query(RegisteredName).filter(RegisteredName.name == name).first():
+        db.close()
+        raise HTTPException(status_code=409, detail="Name already registered.")
+    rn = RegisteredName(name=name)
+    db.add(rn)
+    db.commit()
+    db.close()
+    return {"name": name}
+
 
 # ---------------- API ----------------
 class BookingIn(BaseModel):
@@ -264,8 +336,12 @@ def api_create_booking(payload: BookingIn):
         if overlaps(b.start_at, b.end_at, s, e):
             db.close()
             raise HTTPException(status_code=409, detail="Time slot overlaps an existing booking.")
-    bk = Booking(name=payload.name, start_at=s, end_at=e, minutes=payload.minutes, memo=payload.memo or "")
-    db.add(bk); db.commit(); db.refresh(bk); db.close()
+    bk = Booking(name=payload.name.strip(), start_at=s, end_at=e, minutes=payload.minutes, memo=payload.memo or "")
+    db.add(bk)
+    db.commit()
+    db.refresh(bk)
+    ensure_name_registered(db, payload.name)
+    db.close()
 
     subj = f"【予約】{bk.start_at.strftime('%Y/%m/%d %H:%M')} {bk.name}"
     body = f"{bk.name}\n{bk.start_at.strftime('%Y/%m/%d %H:%M')} - {bk.end_at.strftime('%H:%M')}（{payload.minutes}分）\n{payload.memo or ''}"

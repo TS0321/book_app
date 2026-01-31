@@ -112,6 +112,14 @@ def fetch_bookings(params: dict):
     data.sort(key=lambda x: x["start_at"])
     return data
 
+
+@st.cache_data(ttl=30)
+def fetch_registered_names():
+    """登録済み名前一覧を取得"""
+    r = _session.get(f"{BACKEND}/api/names", timeout=10)
+    r.raise_for_status()
+    return r.json()
+
 def render_booking_card(row: dict, key_prefix: str = ""):
     """一覧カード（Done / Booked / Delete を縦配置）"""
     bid = row["id"]
@@ -178,34 +186,65 @@ tab_new, tab_list, tab_stats, tab_feedback = st.tabs(["新規予約", "一覧操
 
 # ---------- 新規予約 ----------
 with tab_new:
+    try:
+        registered_names = fetch_registered_names()
+    except Exception:
+        registered_names = []
+
+    with st.expander("名前を登録"):
+        with st.form("register_name"):
+            new_name = st.text_input("新しい名前を登録", placeholder="例: 山田太郎", key="reg_name")
+            reg_submitted = st.form_submit_button("登録")
+        if reg_submitted and new_name and new_name.strip():
+            try:
+                rr = _session.post(f"{BACKEND}/api/names", json={"name": new_name.strip()}, timeout=10)
+                if rr.status_code == 201:
+                    st.toast("名前を登録しました", duration=3)
+                    st.cache_data.clear()
+                    st.rerun()
+                elif rr.status_code == 409:
+                    st.warning("その名前は既に登録されています。")
+                else:
+                    st.error(f"登録に失敗しました: {rr.status_code}")
+            except Exception as e:
+                st.error(f"通信エラー: {e}")
+
     with st.form("new_booking"):
-        name = st.text_input("名前", value="")
+        name_options = [""] + registered_names + ["+ 新規登録"]
+        name_choice = st.selectbox("名前", name_options, key="name_choice")
+        if name_choice == "+ 新規登録":
+            name = st.text_input("新しい名前を入力", key="name_new")
+        else:
+            name = name_choice or ""
         date_ = st.date_input("日付", value=dt.date.today())
         time_ = st.time_input("開始時刻", value=next_quarter(dt.datetime.now()).time())
         minutes = st.number_input("所要(分)", min_value=10, max_value=240, step=5, value=30)
         memo = st.text_area("メモ", value="", height=80)
         submitted = st.form_submit_button("予約を作成")
     if submitted:
-        payload = {
-            "name": name,
-            "start_date": str(date_),
-            "start_time": time_.strftime("%H:%M"),
-            "minutes": int(minutes),
-            "memo": memo,
-        }
-        try:
-            r = _session.post(f"{BACKEND}/api/bookings", json=payload, timeout=10)
-            if r.status_code == 201:
-                st.toast("予約できました", duration=4)
-            elif r.status_code == 409:
-                st.error("同時間帯に既存の予約があります。")
-            elif r.status_code == 400:
-                st.error("過去の時刻には予約できません。")
-            else:
-                st.error(f"作成に失敗しました: {r.status_code} {r.text}")
-            st.cache_data.clear()
-        except Exception as e:
-            st.error(f"通信エラー: {e}")
+        if not name or not str(name).strip():
+            st.error("名前を選択するか、「+ 新規登録」で入力してください。")
+        else:
+            payload = {
+                "name": str(name).strip(),
+                "start_date": str(date_),
+                "start_time": time_.strftime("%H:%M"),
+                "minutes": int(minutes),
+                "memo": memo,
+            }
+            try:
+                r = _session.post(f"{BACKEND}/api/bookings", json=payload, timeout=10)
+                if r.status_code == 201:
+                    st.toast("予約できました", duration=4)
+                elif r.status_code == 409:
+                    st.error("同時間帯に既存の予約があります。")
+                elif r.status_code == 400:
+                    st.error("過去の時刻には予約できません。")
+                else:
+                    st.error(f"作成に失敗しました: {r.status_code} {r.text}")
+                st.cache_data.clear()
+            except Exception as e:
+                st.error(f"通信エラー: {e}")
 
 # ---------- 一覧操作 ----------
 with tab_list:

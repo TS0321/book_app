@@ -7,12 +7,45 @@
 
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
 
-<form method="post" action="/new" class="form">
-  <label>名前<input name="name" required value="{{ prefill.name if prefill else '' }}"></label>
+<form method="post" action="/new" class="form" id="booking-form">
+  <label>
+    名前
+    <select id="name_select" aria-label="登録名を選択">
+      <option value="">-- 選択 --</option>
+      {% for n in registered_names or [] %}
+      <option value="{{ n }}">{{ n }}</option>
+      {% endfor %}
+      <option value="__new__">+ 新規入力</option>
+    </select>
+    <input type="text" name="name" id="name_input" required placeholder="選択するか、新規入力"
+           value="{{ prefill.name if prefill else '' }}" style="margin-top:4px;">
+  </label>
   <label>日付<input type="date" name="date_str" required value="{{ prefill.date_str if prefill else '' }}"></label>
   <label>開始時刻<input type="time" name="start_time" required value="{{ prefill.start_time if prefill else '' }}"></label>
   <label>所要時間(分)<input type="number" name="minutes" min="10" step="5" value="{{ prefill.minutes if prefill else 30 }}"></label>
   <label>メモ<textarea name="memo">{{ prefill.memo if prefill else '' }}</textarea></label>
   <button>予約を作成</button>
 </form>
+<script>
+(function(){
+  var sel = document.getElementById('name_select');
+  var inp = document.getElementById('name_input');
+  var prefill = {{ prefill_name_json | safe }};
+  var names = {{ registered_names_json | safe }};
+  function syncFromSelect(){
+    if (sel.value === '__new__' || sel.value === '') {
+      if (sel.value === '__new__') inp.value = '';
+      inp.removeAttribute('readonly');
+    } else {
+      inp.value = sel.value;
+      inp.setAttribute('readonly', 'readonly');
+    }
+  }
+  sel.addEventListener('change', syncFromSelect);
+  inp.addEventListener('input', function(){ if (!inp.readOnly) sel.value = ''; });
+  if (prefill && names.indexOf(prefill) !== -1) { sel.value = prefill; inp.value = prefill; inp.setAttribute('readonly', 'readonly'); }
+  else if (prefill) { sel.value = '__new__'; inp.value = prefill; }
+  else { syncFromSelect(); }
+})();
+</script>
 </body></html>
