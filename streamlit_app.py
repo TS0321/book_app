@@ -1,5 +1,6 @@
 # streamlit_app.py
 import os, requests, datetime as dt
+import base64
 import pandas as pd
 import streamlit as st
 from math import ceil
@@ -7,12 +8,22 @@ from math import ceil
 # 追加：Doneを日別に色付けして表示するカレンダー
 import calendar
 
+def _load_stamp_base64():
+    """ハンコ用の島画像を base64 で読み込む（キャッシュ）"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "shima_meiso.png")
+    if os.path.isfile(path):
+        with open(path, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
+    return None
+
 def render_done_calendar(year: int, month: int, rows: list[dict]):
     """
     rows: /api/bookings で取得した Done の予約（start_at を含む）
     同日内に1件でも Done があれば、その日のセルを緑でハイライト。
-    セル内に 件数 と 合計金額（fee_jpy）も表示。
+    セル内に 件数・合計金額・島画像ハンコを表示。
     """
+    stamp_b64 = _load_stamp_base64()
+
     # 日別の件数と金額集計
     day_count = {}
     day_sum = {}
@@ -27,25 +38,25 @@ def render_done_calendar(year: int, month: int, rows: list[dict]):
     weeks = cal.monthdayscalendar(year, month)  # [[日, 月, 火, 水, 木, 金, 土], ...]
     weekdays_ja = ["日", "月", "火", "水", "木", "金", "土"]
 
-    # スタイル
+    # スタイル（ハンコ画像用追加）
     css = """
     <style>
       .cal { width: 100%; border-collapse: collapse; table-layout: fixed; }
       .cal th, .cal td { border: 1px solid #ddd; vertical-align: top; padding: 6px; height: 92px; }
       .cal th { background: #f7f7f7; text-align:center; font-weight:600; }
       .cal .daynum { font-weight:600; float:right; }
-      .cal .done { background: #e9f7ef; }           /* Doneがある日の背景 */
+      .cal .done { background: #e9f7ef; }
       .cal .count { display:inline-block; font-size: 12px; padding: 2px 6px; border-radius: 10px; background:#d1f0dc; margin-top: 6px;}
       .cal .sum { font-size: 12px; color:#2c7a4b; margin-top: 4px; display:block; }
       .cal .empty { background:#fafafa; }
+      .cal .stamp-wrap { text-align:center; margin-top: 4px; }
+      .cal .stamp-img { width: 36px; height: 36px; object-fit: contain; opacity: 0.85; transform: rotate(-8deg); }
     </style>
     """
 
     # HTML組み立て
     html = ['<table class="cal">']
-    # ヘッダ
     html.append("<tr>" + "".join(f"<th>{w}</th>" for w in weekdays_ja) + "</tr>")
-    # 各週
     for w in weeks:
         html.append("<tr>")
         for day in w:
@@ -60,7 +71,10 @@ def render_done_calendar(year: int, month: int, rows: list[dict]):
             sm  = day_sum.get(day, 0)
             badge = f'<div class="count">{cnt} 件</div>' if cnt else ""
             yen   = f'<span class="sum">¥{sm:,}</span>' if sm else ""
-            html.append(f'<td class="{c}"><span class="daynum">{day}</span>{badge}{yen}</td>')
+            stamp = ""
+            if day in day_count and stamp_b64:
+                stamp = f'<div class="stamp-wrap"><img class="stamp-img" src="data:image/png;base64,{stamp_b64}" alt="済" /></div>'
+            html.append(f'<td class="{c}"><span class="daynum">{day}</span>{badge}{yen}{stamp}</td>')
         html.append("</tr>")
     html.append("</table>")
 
@@ -182,7 +196,7 @@ with tab_new:
         try:
             r = _session.post(f"{BACKEND}/api/bookings", json=payload, timeout=10)
             if r.status_code == 201:
-                st.success("予約を作成しました！")
+                st.toast("予約できました", duration=4)
             elif r.status_code == 409:
                 st.error("同時間帯に既存の予約があります。")
             elif r.status_code == 400:
@@ -204,7 +218,7 @@ with tab_list:
     with col2:
         end_date   = st.date_input("表示終了日", dt.date.today() + dt.timedelta(days=14))
 
-    status_filter = st.selectbox("ステータス", ["(すべて)", "Booked", "Done", "Cancel"])
+    status_filter = st.selectbox("ステータス", ["(すべて)", "Booked", "Done", "Cancel"], index=1)
 
     params = {
         "fr": dt.datetime.combine(start_date, dt.time.min).isoformat(),

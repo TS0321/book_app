@@ -101,7 +101,7 @@ async def notify(subject: str, message: str):
 
 # ---------------- Web画面（既存） ----------------
 @app.get("/", response_class=HTMLResponse)
-def index(request: Request, days: int = 7):
+def index(request: Request, days: int = 7, booking_created: Optional[str] = None):
     db = SessionLocal()
     now = datetime.now(JST)
     # 今日 0:00 から表示（同日の過去も見えるように）
@@ -120,7 +120,10 @@ def index(request: Request, days: int = 7):
     for b in items:
         key = b.start_at.astimezone(JST).date()
         grouped.setdefault(key, []).append(b)
-    return templates.TemplateResponse("index.html", {"request": request, "grouped": grouped, "days": days})
+    return templates.TemplateResponse("index.html", {
+        "request": request, "grouped": grouped, "days": days,
+        "booking_created": booking_created,
+    })
 
 @app.get("/new", response_class=HTMLResponse)
 def new_form(request: Request):
@@ -167,7 +170,7 @@ async def create_booking(
     except RuntimeError:
         asyncio.run(notify(subj, body))
 
-    return RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
+    return RedirectResponse("/?booking_created=1", status_code=status.HTTP_303_SEE_OTHER)
 
 @app.post("/booking/{bid}/status")
 def update_status(bid: int, action: str = Form(...)):

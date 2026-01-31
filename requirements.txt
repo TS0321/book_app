@@ -6,3 +6,6 @@ aiosmtplib
 python-multipart
 python-dotenv
 httpx
+streamlit
+pandas
+requests

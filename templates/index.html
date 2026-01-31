@@ -3,6 +3,13 @@
 <title>Home Pilates</title>
 <link rel="stylesheet" href="/static/style.css">
 </head><body>
+{% if booking_created %}
+<section id="success-banner" class="success-banner" role="alert">
+  <strong>予約できました</strong>（4秒後に消えます）
+</section>
+<script src="/static/hide-success-banner.js"></script>
+{% endif %}
+
 <header>
   <h1>ピラティス予約</h1>
   <nav>
