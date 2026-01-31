@@ -340,19 +340,22 @@ def api_create_booking(payload: BookingIn):
     db.add(bk)
     db.commit()
     db.refresh(bk)
+    # セッションを閉じる前に bk の値を退避（DetachedInstanceError 防止）
+    bk_id, bk_name, bk_start, bk_end = bk.id, bk.name, bk.start_at, bk.end_at
+    bk_minutes, bk_status, bk_fee, bk_memo = bk.minutes, bk.status, bk.fee_jpy, bk.memo
     ensure_name_registered(db, payload.name)
     db.close()
 
-    subj = f"【予約】{bk.start_at.strftime('%Y/%m/%d %H:%M')} {bk.name}"
-    body = f"{bk.name}\n{bk.start_at.strftime('%Y/%m/%d %H:%M')} - {bk.end_at.strftime('%H:%M')}（{payload.minutes}分）\n{payload.memo or ''}"
+    subj = f"【予約】{bk_start.strftime('%Y/%m/%d %H:%M')} {bk_name}"
+    body = f"{bk_name}\n{bk_start.strftime('%Y/%m/%d %H:%M')} - {bk_end.strftime('%H:%M')}（{payload.minutes}分）\n{payload.memo or ''}"
     try:
         asyncio.get_running_loop().create_task(notify(subj, body))
     except RuntimeError:
         asyncio.run(notify(subj, body))
 
     return BookingOut(
-        id=bk.id, name=bk.name, start_at=bk.start_at, end_at=bk.end_at,
-        minutes=bk.minutes, status=bk.status, fee_jpy=bk.fee_jpy, memo=bk.memo
+        id=bk_id, name=bk_name, start_at=bk_start, end_at=bk_end,
+        minutes=bk_minutes, status=bk_status, fee_jpy=bk_fee, memo=bk_memo
     )
 
 @app.post("/api/bookings/{bid}/status", response_model=BookingOut)
