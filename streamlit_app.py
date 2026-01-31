@@ -191,29 +191,14 @@ with tab_new:
     except Exception:
         registered_names = []
 
-    with st.expander("名前を登録"):
-        with st.form("register_name"):
-            new_name = st.text_input("新しい名前を登録", placeholder="例: 山田太郎", key="reg_name")
-            reg_submitted = st.form_submit_button("登録")
-        if reg_submitted and new_name and new_name.strip():
-            try:
-                rr = _session.post(f"{BACKEND}/api/names", json={"name": new_name.strip()}, timeout=10)
-                if rr.status_code == 201:
-                    st.toast("名前を登録しました", duration=3)
-                    st.cache_data.clear()
-                    st.rerun()
-                elif rr.status_code == 409:
-                    st.warning("その名前は既に登録されています。")
-                else:
-                    st.error(f"登録に失敗しました: {rr.status_code}")
-            except Exception as e:
-                st.error(f"通信エラー: {e}")
-
     with st.form("new_booking"):
         name_options = [""] + registered_names + ["+ 新規登録"]
         name_choice = st.selectbox("名前", name_options, key="name_choice")
         if name_choice == "+ 新規登録":
-            name = st.text_input("新しい名前を入力", key="name_new")
+            # 名前欄に「新規登録」などが入らないよう、誤った値をクリア
+            if st.session_state.get("name_new") in ("+ 新規登録", "新規登録"):
+                st.session_state["name_new"] = ""
+            name = st.text_input("新しい名前を入力（入力後、予約を作成で登録されます）", placeholder="例: 山田太郎", key="name_new")
         else:
             name = name_choice or ""
         date_ = st.date_input("日付", value=dt.date.today())
@@ -222,8 +207,13 @@ with tab_new:
         memo = st.text_area("メモ", value="", height=80)
         submitted = st.form_submit_button("予約を作成")
     if submitted:
-        if not name or not str(name).strip():
-            st.error("名前を選択するか、「+ 新規登録」で入力してください。")
+        # 「+ 新規登録」や「新規登録」が名前欄に入っていたら無効（バグ対策）
+        if name_choice == "+ 新規登録":
+            name = str(name).strip() if name else ""
+            if name in ("+ 新規登録", "新規登録"):
+                name = ""
+        if not name:
+            st.error("名前を選択するか、「+ 新規登録」を選んで新しい名前を入力してください。")
         else:
             payload = {
                 "name": str(name).strip(),

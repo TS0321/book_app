@@ -34,17 +34,23 @@
   var names = {{ registered_names_json | safe }};
   function syncFromSelect(){
     if (sel.value === '__new__' || sel.value === '') {
-      if (sel.value === '__new__') inp.value = '';
-      inp.removeAttribute('readonly');
+      if (sel.value === '__new__') {
+        inp.value = '';
+        inp.placeholder = '新しい名前を入力';
+        inp.removeAttribute('readonly');
+      } else {
+        inp.placeholder = '選択するか、新規入力';
+      }
     } else {
       inp.value = sel.value;
+      inp.placeholder = '選択するか、新規入力';
       inp.setAttribute('readonly', 'readonly');
     }
   }
   sel.addEventListener('change', syncFromSelect);
   inp.addEventListener('input', function(){ if (!inp.readOnly) sel.value = ''; });
   if (prefill && names.indexOf(prefill) !== -1) { sel.value = prefill; inp.value = prefill; inp.setAttribute('readonly', 'readonly'); }
-  else if (prefill) { sel.value = '__new__'; inp.value = prefill; }
+  else if (prefill) { sel.value = '__new__'; inp.value = prefill; inp.placeholder = '新しい名前を入力'; }
   else { syncFromSelect(); }
 })();
 </script>
